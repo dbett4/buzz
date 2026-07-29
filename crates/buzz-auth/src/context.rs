@@ -71,6 +71,67 @@ pub enum EnrollmentMode {
     Tofu,
 }
 
+/// Federated-identity requirement resolved for one authorization domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FederatedIdentityRequirement {
+    /// Federated identity is not required for this domain.
+    NotRequired,
+    /// Federated identity is required under the supplied enrollment policy.
+    Required(EnrollmentMode),
+}
+
+/// Server-resolved federated-identity policy for an authorization decision.
+///
+/// Raw request data cannot construct this value. A policy adapter must resolve
+/// the authorization domain's configuration before producing it. The evidence
+/// is intentionally move-only and has no default or deserialization path.
+#[derive(PartialEq, Eq)]
+pub struct ResolvedFederatedPolicy {
+    authorization_domain: CommunityId,
+    requirement: FederatedIdentityRequirement,
+}
+
+impl fmt::Debug for ResolvedFederatedPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ResolvedFederatedPolicy")
+            .field("authorization_domain", &"[redacted]")
+            .field("requirement", &self.requirement)
+            .finish()
+    }
+}
+
+impl ResolvedFederatedPolicy {
+    #[cfg(test)]
+    pub(crate) const fn not_required(authorization_domain: CommunityId) -> Self {
+        Self {
+            authorization_domain,
+            requirement: FederatedIdentityRequirement::NotRequired,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn required(
+        authorization_domain: CommunityId,
+        enrollment_mode: EnrollmentMode,
+    ) -> Self {
+        Self {
+            authorization_domain,
+            requirement: FederatedIdentityRequirement::Required(enrollment_mode),
+        }
+    }
+
+    /// Authorization domain whose configuration was resolved.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.authorization_domain
+    }
+
+    /// Resolved federated-identity requirement.
+    pub const fn requirement(&self) -> FederatedIdentityRequirement {
+        self.requirement
+    }
+}
+
 /// Provenance recorded when a binding is created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindingSource {
@@ -115,6 +176,36 @@ impl AssertionExpiry {
     }
 }
 
+/// Earliest valid time from a validated federated assertion, as Unix seconds.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AssertionNotBefore(u64);
+
+impl fmt::Debug for AssertionNotBefore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("AssertionNotBefore")
+            .field(&"[redacted]")
+            .finish()
+    }
+}
+
+impl AssertionNotBefore {
+    /// Preserve a validated `nbf` timestamp for finalization checks.
+    pub const fn new(unix_seconds: u64) -> Self {
+        Self(unix_seconds)
+    }
+
+    /// Earliest valid time as seconds since the Unix epoch.
+    pub const fn unix_seconds(self) -> u64 {
+        self.0
+    }
+
+    /// Returns `true` while the assertion is not yet valid at `now`.
+    pub const fn is_not_yet_valid_at(self, now_unix_seconds: u64) -> bool {
+        self.0 > now_unix_seconds
+    }
+}
+
 /// Expiry imposed by a separately verified delegation proof.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DelegationExpiry(u64);
@@ -149,11 +240,11 @@ impl DelegationExpiry {
 }
 
 /// Server-verified Nostr authority for a request or connection.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct NostrAuthority {
     actor_pubkey: PublicKey,
     proof_method: AuthMethod,
-    verified_owner_pubkey: Option<PublicKey>,
+    verified_delegation: Option<VerifiedTransportDelegation>,
 }
 
 impl fmt::Debug for NostrAuthority {
@@ -163,23 +254,19 @@ impl fmt::Debug for NostrAuthority {
             .field("actor_pubkey", &"[redacted]")
             .field("proof_method", &self.proof_method)
             .field(
-                "verified_owner_pubkey",
-                &self.verified_owner_pubkey.map(|_| "[redacted]"),
+                "verified_delegation",
+                &self.verified_delegation.as_ref().map(|_| "[redacted]"),
             )
             .finish()
     }
 }
 
 impl NostrAuthority {
-    fn new(
-        actor_pubkey: PublicKey,
-        proof_method: AuthMethod,
-        verified_owner_pubkey: Option<PublicKey>,
-    ) -> Self {
+    fn new(proof: VerifiedNostrProof) -> Self {
         Self {
-            actor_pubkey,
-            proof_method,
-            verified_owner_pubkey,
+            actor_pubkey: proof.actor_pubkey,
+            proof_method: proof.proof_method,
+            verified_delegation: proof.verified_delegation,
         }
     }
 
@@ -195,7 +282,15 @@ impl NostrAuthority {
 
     /// Cryptographically verified owner for a delegated Nostr actor.
     pub const fn verified_owner_pubkey(&self) -> Option<PublicKey> {
-        self.verified_owner_pubkey
+        match &self.verified_delegation {
+            Some(delegation) => Some(delegation.owner_pubkey()),
+            None => None,
+        }
+    }
+
+    /// Cryptographically verified owner-to-actor delegation, when present.
+    pub const fn verified_delegation(&self) -> Option<&VerifiedTransportDelegation> {
+        self.verified_delegation.as_ref()
     }
 }
 
@@ -247,6 +342,91 @@ impl fmt::Debug for FederatedPrincipal {
     }
 }
 
+/// Federated assertion accepted by the configured assertion verifier.
+///
+/// The verifier must enforce an allowed algorithm and key, require correctly
+/// typed `exp`, `iss`, and `aud` claims, validate the issuer and audience, and
+/// reject a malformed `nbf` before constructing this evidence. Finalization
+/// independently enforces the preserved `nbf` against server time. Raw
+/// assertion claims cannot construct it from outside `buzz-auth`. Private
+/// identity attributes and public display labels are deliberately excluded.
+/// The evidence is intentionally move-only and has no default or
+/// deserialization path.
+#[derive(PartialEq, Eq)]
+pub struct VerifiedFederatedAssertion {
+    authorization_domain: CommunityId,
+    authorized_transport: AuthTransport,
+    principal: FederatedPrincipal,
+    transport: AssertionTransport,
+    not_before: Option<AssertionNotBefore>,
+    expires_at: AssertionExpiry,
+}
+
+impl VerifiedFederatedAssertion {
+    #[cfg(test)]
+    pub(crate) const fn new(
+        authorization_domain: CommunityId,
+        authorized_transport: AuthTransport,
+        principal: FederatedPrincipal,
+        transport: AssertionTransport,
+        not_before: Option<AssertionNotBefore>,
+        expires_at: AssertionExpiry,
+    ) -> Self {
+        Self {
+            authorization_domain,
+            authorized_transport,
+            principal,
+            transport,
+            not_before,
+            expires_at,
+        }
+    }
+
+    /// Authorization domain for which the assertion was verified.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.authorization_domain
+    }
+
+    /// Transport whose request or connection the verifier authorized.
+    pub const fn authorized_transport(&self) -> AuthTransport {
+        self.authorized_transport
+    }
+
+    /// Issuer-qualified principal from the verified assertion.
+    pub const fn principal(&self) -> &FederatedPrincipal {
+        &self.principal
+    }
+
+    /// Verified assertion delivery profile.
+    pub const fn transport(&self) -> AssertionTransport {
+        self.transport
+    }
+
+    /// Earliest valid time preserved from the verified assertion, when present.
+    pub const fn not_before(&self) -> Option<AssertionNotBefore> {
+        self.not_before
+    }
+
+    /// Upper time bound carried by the verified assertion.
+    pub const fn expires_at(&self) -> AssertionExpiry {
+        self.expires_at
+    }
+}
+
+impl fmt::Debug for VerifiedFederatedAssertion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedFederatedAssertion")
+            .field("authorization_domain", &"[redacted]")
+            .field("authorized_transport", &self.authorized_transport)
+            .field("principal", &self.principal)
+            .field("transport", &self.transport)
+            .field("not_before", &self.not_before.map(|_| "[redacted]"))
+            .field("expires_at", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Monotonically increasing version of an identity-to-key binding.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BindingVersion(u64);
@@ -281,8 +461,10 @@ impl BindingVersion {
 /// Stable reference to one active identity-to-key binding.
 ///
 /// This reference is identity evidence. It is not an authorization lease and
-/// does not by itself provide expiry or live-revocation enforcement.
-#[derive(Clone, PartialEq, Eq)]
+/// does not by itself provide expiry or live-revocation enforcement. An
+/// authoritative binding adapter constructs this move-only value after checking
+/// active lifecycle state; it has no default or deserialization path.
+#[derive(PartialEq, Eq)]
 pub struct VersionedBindingRef {
     authorization_domain: CommunityId,
     binding_id: Uuid,
@@ -308,7 +490,8 @@ impl fmt::Debug for VersionedBindingRef {
 
 impl VersionedBindingRef {
     /// Build a reference to an active, versioned binding.
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         authorization_domain: CommunityId,
         binding_id: Uuid,
         principal: FederatedPrincipal,
@@ -360,29 +543,46 @@ impl VersionedBindingRef {
     }
 }
 
-/// Separately verified delegation from a bound owner to the authenticated key.
-#[derive(Clone, PartialEq, Eq)]
-pub struct VerifiedDelegation {
+/// Capability represented by a verified owner-to-delegate proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationCapability {
+    /// Authorizes the complete request or connection represented by the context.
+    TransportWide,
+}
+
+/// Transport-wide delegation from a bound owner to the authenticated key.
+///
+/// A verifier may construct this only after proving the capability authorizes
+/// the complete target request or connection. Time-only constraints may be
+/// reduced to [`DelegationExpiry`], but operation-, event-kind-, or
+/// request-specific constraints must not be discarded or promoted into this
+/// transport-wide evidence. This move-only evidence has no default or
+/// deserialization path.
+#[derive(PartialEq, Eq)]
+pub struct VerifiedTransportDelegation {
     owner_pubkey: PublicKey,
     delegate_pubkey: PublicKey,
+    capability: DelegationCapability,
     expires_at: Option<DelegationExpiry>,
 }
 
-impl fmt::Debug for VerifiedDelegation {
+impl fmt::Debug for VerifiedTransportDelegation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("VerifiedDelegation")
+            .debug_struct("VerifiedTransportDelegation")
             .field("owner_pubkey", &"[redacted]")
             .field("delegate_pubkey", &"[redacted]")
+            .field("capability", &self.capability)
             .field("expires_at", &self.expires_at.map(|_| "[redacted]"))
             .finish()
     }
 }
 
-impl VerifiedDelegation {
-    /// Build a verified delegation result after the caller has validated the
-    /// delegation proof against both keys and any transport-specific context.
-    pub fn new(
+impl VerifiedTransportDelegation {
+    /// Build transport-wide evidence after validating both keys and confirming
+    /// that no narrower capability constraint is being discarded.
+    #[cfg(test)]
+    pub(crate) fn new_unrestricted(
         owner_pubkey: PublicKey,
         delegate_pubkey: PublicKey,
         expires_at: Option<DelegationExpiry>,
@@ -393,6 +593,7 @@ impl VerifiedDelegation {
         Ok(Self {
             owner_pubkey,
             delegate_pubkey,
+            capability: DelegationCapability::TransportWide,
             expires_at,
         })
     }
@@ -407,9 +608,100 @@ impl VerifiedDelegation {
         self.delegate_pubkey
     }
 
+    /// Verified capability scope.
+    pub const fn capability(&self) -> DelegationCapability {
+        self.capability
+    }
+
     /// Optional upper bound imposed by the delegation proof.
     pub const fn expires_at(&self) -> Option<DelegationExpiry> {
         self.expires_at
+    }
+}
+
+/// Cryptographically verified Nostr proof for one request or connection.
+///
+/// Transport verifiers inside `buzz-auth` produce this evidence after checking
+/// the signature and transport-specific binding. Raw request keys and claimed
+/// proof methods cannot construct it in relay call sites. Conditional
+/// delegation may be attached only when it has been fully evaluated for the
+/// target operation or safely reduced to transport-wide evidence. The evidence
+/// is intentionally move-only and has no default or deserialization path.
+#[derive(PartialEq, Eq)]
+pub struct VerifiedNostrProof {
+    authorization_domain: CommunityId,
+    authorized_transport: AuthTransport,
+    actor_pubkey: PublicKey,
+    proof_method: AuthMethod,
+    verified_delegation: Option<VerifiedTransportDelegation>,
+}
+
+impl VerifiedNostrProof {
+    #[cfg(test)]
+    pub(crate) fn new(
+        authorization_domain: CommunityId,
+        authorized_transport: AuthTransport,
+        actor_pubkey: PublicKey,
+        proof_method: AuthMethod,
+        verified_delegation: Option<VerifiedTransportDelegation>,
+    ) -> Result<Self, AuthContextError> {
+        if !transport_accepts_proof(authorized_transport, proof_method) {
+            return Err(AuthContextError::TransportProofMismatch);
+        }
+        if verified_delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.delegate_pubkey() != actor_pubkey)
+        {
+            return Err(AuthContextError::DelegateKeyMismatch);
+        }
+        Ok(Self {
+            authorization_domain,
+            authorized_transport,
+            actor_pubkey,
+            proof_method,
+            verified_delegation,
+        })
+    }
+
+    /// Authorization domain for which the Nostr proof was verified.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.authorization_domain
+    }
+
+    /// Transport whose request or connection the proof authorized.
+    pub const fn authorized_transport(&self) -> AuthTransport {
+        self.authorized_transport
+    }
+
+    /// Authenticated Nostr actor.
+    pub const fn actor_pubkey(&self) -> PublicKey {
+        self.actor_pubkey
+    }
+
+    /// Cryptographic proof method accepted by the verifier.
+    pub const fn proof_method(&self) -> AuthMethod {
+        self.proof_method
+    }
+
+    /// Verified owner-to-actor delegation, when present.
+    pub const fn verified_delegation(&self) -> Option<&VerifiedTransportDelegation> {
+        self.verified_delegation.as_ref()
+    }
+}
+
+impl fmt::Debug for VerifiedNostrProof {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedNostrProof")
+            .field("authorization_domain", &"[redacted]")
+            .field("authorized_transport", &self.authorized_transport)
+            .field("actor_pubkey", &"[redacted]")
+            .field("proof_method", &self.proof_method)
+            .field(
+                "verified_delegation",
+                &self.verified_delegation.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
     }
 }
 
@@ -446,7 +738,7 @@ impl AuthorizationReason {
 }
 
 /// Federated authorization attached to a Nostr-authenticated actor.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum FederatedAuthorization {
     /// This deployment does not require federated identity.
     ///
@@ -457,14 +749,8 @@ pub enum FederatedAuthorization {
     Direct {
         /// Active identity-to-key binding.
         binding: VersionedBindingRef,
-        /// Principal extracted from the currently validated assertion.
-        assertion_principal: FederatedPrincipal,
-        /// Assertion delivery profile used by the verifier.
-        assertion_transport: AssertionTransport,
-        /// Enrollment policy evaluated for the authorization domain.
-        enrollment_mode: EnrollmentMode,
-        /// Upper bound for authorization derived from the assertion.
-        assertion_expires_at: AssertionExpiry,
+        /// Current assertion accepted by the configured verifier.
+        assertion: VerifiedFederatedAssertion,
         /// Stable reason describing whether the binding existed or was enrolled.
         reason: AuthorizationReason,
     },
@@ -472,14 +758,8 @@ pub enum FederatedAuthorization {
     Delegated {
         /// Owner's active binding.
         owner: VersionedBindingRef,
-        /// Owner principal extracted from the currently validated assertion.
-        assertion_principal: FederatedPrincipal,
-        /// Assertion delivery profile used by the verifier.
-        assertion_transport: AssertionTransport,
-        /// Upper bound for authorization derived from the owner's assertion.
-        assertion_expires_at: AssertionExpiry,
-        /// Separately verified owner-to-delegate proof.
-        delegation: VerifiedDelegation,
+        /// Current owner assertion accepted by the configured verifier.
+        assertion: VerifiedFederatedAssertion,
     },
 }
 
@@ -489,83 +769,117 @@ impl fmt::Debug for FederatedAuthorization {
             Self::NotRequired => formatter.write_str("NotRequired"),
             Self::Direct {
                 binding,
-                assertion_transport,
-                enrollment_mode,
+                assertion,
                 reason,
                 ..
             } => formatter
                 .debug_struct("Direct")
                 .field("binding", binding)
-                .field("assertion_principal", &"[redacted]")
-                .field("assertion_transport", assertion_transport)
-                .field("enrollment_mode", enrollment_mode)
-                .field("assertion_expires_at", &"[redacted]")
+                .field("assertion", assertion)
                 .field("reason", reason)
                 .finish(),
-            Self::Delegated {
-                owner,
-                assertion_transport,
-                delegation,
-                ..
-            } => formatter
+            Self::Delegated { owner, assertion } => formatter
                 .debug_struct("Delegated")
                 .field("owner", owner)
-                .field("assertion_principal", &"[redacted]")
-                .field("assertion_transport", assertion_transport)
-                .field("assertion_expires_at", &"[redacted]")
-                .field("delegation", delegation)
+                .field("assertion", assertion)
                 .finish(),
         }
     }
 }
 
+/// Successful community admission and permissions for one decision.
+///
+/// An authorization adapter may construct this value only after membership,
+/// invite, moderation, or equivalent community policy has allowed the actor.
+/// Durable identity enrollment and public assertion publication must not occur
+/// before this evidence exists; future binding adapters should require a borrow
+/// of it before committing either side effect. Raw request scopes and channel
+/// identifiers cannot construct this value in relay call sites. The resolution
+/// is intentionally move-only and has no default or deserialization path.
+#[derive(PartialEq, Eq)]
+pub struct AuthorizedCommunityAccess {
+    authorization_domain: CommunityId,
+    scopes: Vec<Scope>,
+    channel_ids: Option<Vec<Uuid>>,
+}
+
+impl AuthorizedCommunityAccess {
+    #[cfg(test)]
+    pub(crate) const fn new(
+        authorization_domain: CommunityId,
+        scopes: Vec<Scope>,
+        channel_ids: Option<Vec<Uuid>>,
+    ) -> Self {
+        Self {
+            authorization_domain,
+            scopes,
+            channel_ids,
+        }
+    }
+
+    /// Authorization domain for which the permissions were resolved.
+    pub const fn authorization_domain(&self) -> CommunityId {
+        self.authorization_domain
+    }
+
+    /// Permission scopes resolved for the decision.
+    pub fn scopes(&self) -> &[Scope] {
+        &self.scopes
+    }
+
+    /// Optional channel restriction resolved for the decision.
+    pub fn channel_ids(&self) -> Option<&[Uuid]> {
+        self.channel_ids.as_deref()
+    }
+}
+
+impl fmt::Debug for AuthorizedCommunityAccess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthorizedCommunityAccess")
+            .field("authorization_domain", &"[redacted]")
+            .field("scopes", &"[redacted]")
+            .field("channel_ids", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Initial shared authorization-context contract.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct AuthContextV1 {
     tenant: TenantContext,
     correlation_id: Uuid,
     transport: AuthTransport,
     nostr: NostrAuthority,
+    federated_policy: ResolvedFederatedPolicy,
     federated: FederatedAuthorization,
     scopes: Vec<Scope>,
     channel_ids: Option<Vec<Uuid>>,
 }
 
 /// Server-verified inputs consumed by the V1 authorization finalizer.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct AuthContextInput {
     tenant: TenantContext,
     correlation_id: Uuid,
-    transport: AuthTransport,
-    actor_pubkey: PublicKey,
-    proof_method: AuthMethod,
-    verified_owner_pubkey: Option<PublicKey>,
-    scopes: Vec<Scope>,
-    channel_ids: Option<Vec<Uuid>>,
+    nostr_proof: VerifiedNostrProof,
+    community_access: AuthorizedCommunityAccess,
 }
 
 impl AuthContextInput {
-    /// Collect values that have already passed their transport-specific checks.
-    #[allow(clippy::too_many_arguments)]
+    /// Collect evidence after cryptographic authentication and community
+    /// admission have both succeeded.
     pub fn new(
         tenant: TenantContext,
         correlation_id: Uuid,
-        transport: AuthTransport,
-        actor_pubkey: PublicKey,
-        proof_method: AuthMethod,
-        verified_owner_pubkey: Option<PublicKey>,
-        scopes: Vec<Scope>,
-        channel_ids: Option<Vec<Uuid>>,
+        nostr_proof: VerifiedNostrProof,
+        community_access: AuthorizedCommunityAccess,
     ) -> Self {
         Self {
             tenant,
             correlation_id,
-            transport,
-            actor_pubkey,
-            proof_method,
-            verified_owner_pubkey,
-            scopes,
-            channel_ids,
+            nostr_proof,
+            community_access,
         }
     }
 }
@@ -578,6 +892,7 @@ impl fmt::Debug for AuthContextV1 {
             .field("correlation_id", &"[redacted]")
             .field("transport", &self.transport)
             .field("nostr", &self.nostr)
+            .field("federated_policy", &self.federated_policy)
             .field("federated", &self.federated)
             .field("scopes", &"[redacted]")
             .field("channel_ids", &"[redacted]")
@@ -586,7 +901,11 @@ impl fmt::Debug for AuthContextV1 {
 }
 
 /// Versioned result of successful request or connection authorization.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// This security-boundary type intentionally has no default or deserialization
+/// path. Persisted or transported data must be re-verified and finalized rather
+/// than decoded directly into an authorized context.
+#[derive(PartialEq, Eq)]
 pub enum AuthContext {
     /// Initial shared authorization-context contract.
     V1(AuthContextV1),
@@ -603,36 +922,52 @@ impl fmt::Debug for AuthContext {
 impl AuthContext {
     /// Validate all authorization evidence and finalize an immutable V1 context.
     ///
+    /// Adapters must preserve this phase order: cryptographic proof and
+    /// read-only assertion validation; community admission and capability
+    /// resolution; atomic binding/enrollment; then finalization. A denial before
+    /// admission must not create or refresh a binding, claim membership, or
+    /// publish a public identity assertion.
+    ///
     /// `now_unix_seconds` must come from the server clock for the authorization
     /// decision being finalized.
     pub fn finalize_v1(
         input: AuthContextInput,
+        federated_policy: ResolvedFederatedPolicy,
         authorization: FederatedAuthorization,
         now_unix_seconds: u64,
     ) -> Result<Self, AuthContextError> {
-        if !transport_accepts_proof(input.transport, input.proof_method) {
+        let authorization_domain = input.tenant.community();
+        let transport = input.nostr_proof.authorized_transport();
+        if input.nostr_proof.authorization_domain() != authorization_domain {
+            return Err(AuthContextError::NostrProofDomainMismatch);
+        }
+        if federated_policy.authorization_domain() != authorization_domain {
+            return Err(AuthContextError::PolicyDomainMismatch);
+        }
+        if input.community_access.authorization_domain() != authorization_domain {
+            return Err(AuthContextError::CommunityAccessDomainMismatch);
+        }
+        if !transport_accepts_proof(transport, input.nostr_proof.proof_method()) {
             return Err(AuthContextError::TransportProofMismatch);
         }
         validate_federated_authorization(
-            input.tenant.community(),
-            input.actor_pubkey,
-            input.verified_owner_pubkey,
+            authorization_domain,
+            transport,
+            &input.nostr_proof,
+            &federated_policy,
             &authorization,
             now_unix_seconds,
         )?;
-        let nostr = NostrAuthority::new(
-            input.actor_pubkey,
-            input.proof_method,
-            input.verified_owner_pubkey,
-        );
+        let nostr = NostrAuthority::new(input.nostr_proof);
         Ok(Self::V1(AuthContextV1 {
             tenant: input.tenant,
             correlation_id: input.correlation_id,
-            transport: input.transport,
+            transport,
             nostr,
+            federated_policy,
             federated: authorization,
-            scopes: input.scopes,
-            channel_ids: input.channel_ids,
+            scopes: input.community_access.scopes,
+            channel_ids: input.community_access.channel_ids,
         }))
     }
 
@@ -693,6 +1028,13 @@ impl AuthContext {
         }
     }
 
+    /// Federated-identity policy resolved for this authorization decision.
+    pub const fn federated_policy(&self) -> &ResolvedFederatedPolicy {
+        match self {
+            Self::V1(context) => &context.federated_policy,
+        }
+    }
+
     /// Stable reason for the successful authorization decision.
     pub const fn authorization_reason(&self) -> AuthorizationReason {
         match self.federated_authorization() {
@@ -734,67 +1076,80 @@ const fn transport_accepts_proof(transport: AuthTransport, proof_method: AuthMet
 
 fn validate_federated_authorization(
     authorization_domain: CommunityId,
-    actor_pubkey: PublicKey,
-    verified_owner: Option<PublicKey>,
+    authorized_transport: AuthTransport,
+    nostr_proof: &VerifiedNostrProof,
+    federated_policy: &ResolvedFederatedPolicy,
     authorization: &FederatedAuthorization,
     now_unix_seconds: u64,
 ) -> Result<(), AuthContextError> {
-    if verified_owner == Some(actor_pubkey) {
-        return Err(AuthContextError::SelfDelegation);
+    match (federated_policy.requirement(), authorization) {
+        (FederatedIdentityRequirement::Required(_), FederatedAuthorization::NotRequired) => {
+            return Err(AuthContextError::FederatedIdentityRequired);
+        }
+        (FederatedIdentityRequirement::NotRequired, FederatedAuthorization::NotRequired) => {}
+        (FederatedIdentityRequirement::NotRequired, _) => {
+            return Err(AuthContextError::UnexpectedFederatedAuthorization);
+        }
+        (FederatedIdentityRequirement::Required(_), _) => {}
     }
+
+    let actor_pubkey = nostr_proof.actor_pubkey();
+    let verified_delegation = nostr_proof.verified_delegation();
     match authorization {
         FederatedAuthorization::NotRequired => {}
         FederatedAuthorization::Direct {
             binding,
-            assertion_principal,
-            enrollment_mode,
-            assertion_expires_at,
+            assertion,
             reason,
-            ..
         } => {
             if binding.authorization_domain() != authorization_domain {
                 return Err(AuthContextError::BindingDomainMismatch);
             }
-            if assertion_principal != binding.principal() {
+            if assertion.authorization_domain() != authorization_domain {
+                return Err(AuthContextError::AssertionDomainMismatch);
+            }
+            if assertion.authorized_transport() != authorized_transport {
+                return Err(AuthContextError::AssertionTransportMismatch);
+            }
+            if assertion.principal() != binding.principal() {
                 return Err(AuthContextError::AssertionPrincipalMismatch);
             }
-            if verified_owner.is_some() {
+            if verified_delegation.is_some() {
                 return Err(AuthContextError::DirectAuthorizationHasOwner);
             }
             if binding.bound_pubkey() != actor_pubkey {
                 return Err(AuthContextError::DirectBindingKeyMismatch);
             }
-            if assertion_expires_at.is_expired_at(now_unix_seconds) {
-                return Err(AuthContextError::AssertionExpired);
-            }
-            if !direct_reason_is_valid(*reason, *enrollment_mode, binding.source()) {
+            validate_assertion_time(assertion, now_unix_seconds)?;
+            let FederatedIdentityRequirement::Required(enrollment_mode) =
+                federated_policy.requirement()
+            else {
+                return Err(AuthContextError::UnexpectedFederatedAuthorization);
+            };
+            if !direct_reason_is_valid(*reason, enrollment_mode, binding.source()) {
                 return Err(AuthContextError::InvalidAuthorizationReason);
             }
         }
-        FederatedAuthorization::Delegated {
-            owner,
-            assertion_principal,
-            assertion_expires_at,
-            delegation,
-            ..
-        } => {
+        FederatedAuthorization::Delegated { owner, assertion } => {
             if owner.authorization_domain() != authorization_domain {
                 return Err(AuthContextError::BindingDomainMismatch);
             }
-            if assertion_principal != owner.principal() {
+            if assertion.authorization_domain() != authorization_domain {
+                return Err(AuthContextError::AssertionDomainMismatch);
+            }
+            if assertion.authorized_transport() != authorized_transport {
+                return Err(AuthContextError::AssertionTransportMismatch);
+            }
+            if assertion.principal() != owner.principal() {
                 return Err(AuthContextError::AssertionPrincipalMismatch);
             }
-            if delegation.delegate_pubkey() != actor_pubkey {
-                return Err(AuthContextError::DelegateKeyMismatch);
-            }
-            if delegation.owner_pubkey() != owner.bound_pubkey()
-                || verified_owner != Some(owner.bound_pubkey())
-            {
+            let Some(delegation) = verified_delegation else {
+                return Err(AuthContextError::DelegationRequired);
+            };
+            if delegation.owner_pubkey() != owner.bound_pubkey() {
                 return Err(AuthContextError::DelegatedOwnerMismatch);
             }
-            if assertion_expires_at.is_expired_at(now_unix_seconds) {
-                return Err(AuthContextError::AssertionExpired);
-            }
+            validate_assertion_time(assertion, now_unix_seconds)?;
             if delegation
                 .expires_at()
                 .is_some_and(|expiry| expiry.is_expired_at(now_unix_seconds))
@@ -802,6 +1157,22 @@ fn validate_federated_authorization(
                 return Err(AuthContextError::DelegationExpired);
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_assertion_time(
+    assertion: &VerifiedFederatedAssertion,
+    now_unix_seconds: u64,
+) -> Result<(), AuthContextError> {
+    if assertion
+        .not_before()
+        .is_some_and(|not_before| not_before.is_not_yet_valid_at(now_unix_seconds))
+    {
+        return Err(AuthContextError::AssertionNotYetValid);
+    }
+    if assertion.expires_at().is_expired_at(now_unix_seconds) {
+        return Err(AuthContextError::AssertionExpired);
     }
     Ok(())
 }
@@ -852,6 +1223,15 @@ pub enum AuthContextError {
     /// Assertion had expired when authorization was evaluated.
     #[error("federated assertion has expired")]
     AssertionExpired,
+    /// Assertion was used before its validated not-before bound.
+    #[error("federated assertion is not yet valid")]
+    AssertionNotYetValid,
+    /// Resolved policy required federated identity, but none was supplied.
+    #[error("federated identity is required by the resolved authorization policy")]
+    FederatedIdentityRequired,
+    /// Federated authorization was supplied for a domain that does not use it.
+    #[error("federated authorization does not match the resolved authorization policy")]
+    UnexpectedFederatedAuthorization,
     /// Delegation had expired when authorization was evaluated.
     #[error("verified delegation has expired")]
     DelegationExpired,
@@ -864,6 +1244,21 @@ pub enum AuthContextError {
     /// Binding belonged to a different server-resolved authorization domain.
     #[error("federated binding does not belong to the authorization domain")]
     BindingDomainMismatch,
+    /// Nostr proof was verified for a different authorization domain.
+    #[error("Nostr proof does not belong to the authorization domain")]
+    NostrProofDomainMismatch,
+    /// Federated policy was resolved for a different authorization domain.
+    #[error("federated policy does not belong to the authorization domain")]
+    PolicyDomainMismatch,
+    /// Community admission was resolved for a different authorization domain.
+    #[error("community admission does not belong to the authorization domain")]
+    CommunityAccessDomainMismatch,
+    /// Assertion was verified for a different authorization domain.
+    #[error("federated assertion does not belong to the authorization domain")]
+    AssertionDomainMismatch,
+    /// Assertion was verified for a different transport.
+    #[error("federated assertion does not match the authorization transport")]
+    AssertionTransportMismatch,
     /// Validated assertion principal did not match the active binding.
     #[error("federated assertion principal does not match the active binding")]
     AssertionPrincipalMismatch,
@@ -879,6 +1274,9 @@ pub enum AuthContextError {
     /// Delegated authorization named a different actor.
     #[error("delegated federated authorization does not match the authenticated Nostr key")]
     DelegateKeyMismatch,
+    /// Delegated federated authorization lacked verified Nostr delegation.
+    #[error("delegated federated authorization requires verified Nostr delegation")]
+    DelegationRequired,
     /// Delegated authorization did not match the verified Nostr owner.
     #[error("delegated federated authorization does not match the verified Nostr owner")]
     DelegatedOwnerMismatch,
@@ -895,15 +1293,24 @@ impl AuthContextError {
             Self::InvalidAssertionExpiry => "federated_assertion_invalid_expiry",
             Self::InvalidDelegationExpiry => "delegation_invalid_expiry",
             Self::AssertionExpired => "federated_assertion_expired",
+            Self::AssertionNotYetValid => "federated_assertion_not_yet_valid",
+            Self::FederatedIdentityRequired => "federated_identity_required",
+            Self::UnexpectedFederatedAuthorization => "federated_authorization_unexpected",
             Self::DelegationExpired => "delegation_expired",
             Self::SelfDelegation => "delegation_self_reference",
             Self::InvalidAuthorizationReason => "federated_binding_invalid_reason",
             Self::BindingDomainMismatch => "federated_binding_domain_mismatch",
+            Self::NostrProofDomainMismatch => "nostr_proof_domain_mismatch",
+            Self::PolicyDomainMismatch => "federated_policy_domain_mismatch",
+            Self::CommunityAccessDomainMismatch => "community_access_domain_mismatch",
+            Self::AssertionDomainMismatch => "federated_assertion_domain_mismatch",
+            Self::AssertionTransportMismatch => "federated_assertion_transport_mismatch",
             Self::AssertionPrincipalMismatch => "federated_assertion_principal_mismatch",
             Self::TransportProofMismatch => "nostr_transport_proof_mismatch",
             Self::DirectAuthorizationHasOwner => "federated_direct_has_owner",
             Self::DirectBindingKeyMismatch => "federated_direct_key_mismatch",
             Self::DelegateKeyMismatch => "federated_delegate_key_mismatch",
+            Self::DelegationRequired => "federated_delegation_required",
             Self::DelegatedOwnerMismatch => "federated_delegated_owner_mismatch",
         }
     }
@@ -916,15 +1323,71 @@ mod tests {
     use nostr::Keys;
 
     fn tenant(value: u128) -> TenantContext {
-        TenantContext::resolved(
-            CommunityId::from_uuid(Uuid::from_u128(value)),
-            "relay.example",
-        )
+        TenantContext::resolved(authorization_domain(value), "relay.example")
+    }
+
+    fn authorization_domain(value: u128) -> CommunityId {
+        CommunityId::from_uuid(Uuid::from_u128(value))
     }
 
     fn principal() -> FederatedPrincipal {
         FederatedPrincipal::new("https://idp.example", "subject-123")
             .expect("synthetic principal is valid")
+    }
+
+    fn assertion(
+        principal: FederatedPrincipal,
+        transport: AssertionTransport,
+        expiry: u64,
+    ) -> VerifiedFederatedAssertion {
+        let authorized_transport = match transport {
+            AssertionTransport::TrustedProxy => AuthTransport::RelayWebSocket,
+            AssertionTransport::ClientAttached => AuthTransport::HttpBridge,
+        };
+        assertion_in(1, authorized_transport, principal, transport, expiry)
+    }
+
+    fn assertion_in(
+        domain: u128,
+        authorized_transport: AuthTransport,
+        principal: FederatedPrincipal,
+        transport: AssertionTransport,
+        expiry: u64,
+    ) -> VerifiedFederatedAssertion {
+        assertion_with_bounds_in(
+            domain,
+            authorized_transport,
+            principal,
+            transport,
+            None,
+            expiry,
+        )
+    }
+
+    fn assertion_with_bounds_in(
+        domain: u128,
+        authorized_transport: AuthTransport,
+        principal: FederatedPrincipal,
+        transport: AssertionTransport,
+        not_before: Option<u64>,
+        expiry: u64,
+    ) -> VerifiedFederatedAssertion {
+        VerifiedFederatedAssertion::new(
+            authorization_domain(domain),
+            authorized_transport,
+            principal,
+            transport,
+            not_before.map(AssertionNotBefore::new),
+            AssertionExpiry::new(expiry).expect("synthetic assertion expiry is valid"),
+        )
+    }
+
+    fn policy_not_required() -> ResolvedFederatedPolicy {
+        ResolvedFederatedPolicy::not_required(authorization_domain(1))
+    }
+
+    fn policy_required(enrollment_mode: EnrollmentMode) -> ResolvedFederatedPolicy {
+        ResolvedFederatedPolicy::required(authorization_domain(1), enrollment_mode)
     }
 
     fn binding(pubkey: PublicKey) -> VersionedBindingRef {
@@ -933,7 +1396,7 @@ mod tests {
 
     fn binding_in(domain: u128, pubkey: PublicKey) -> VersionedBindingRef {
         VersionedBindingRef::new(
-            CommunityId::from_uuid(Uuid::from_u128(domain)),
+            authorization_domain(domain),
             Uuid::from_u128(10),
             principal(),
             pubkey,
@@ -948,44 +1411,81 @@ mod tests {
         transport: AuthTransport,
         verified_owner_pubkey: Option<PublicKey>,
     ) -> AuthContextInput {
-        AuthContextInput::new(
-            tenant(1),
-            Uuid::from_u128(2),
-            transport,
-            actor_pubkey,
-            match transport {
-                AuthTransport::RelayWebSocket | AuthTransport::Audio => AuthMethod::Nip42,
-                _ => AuthMethod::Nip98,
-            },
-            verified_owner_pubkey,
-            Scope::all_known(),
-            None,
-        )
+        input_with_delegation_expiry(actor_pubkey, transport, verified_owner_pubkey, 200)
     }
 
-    fn delegated_authorization(
-        domain: u128,
-        owner_pubkey: PublicKey,
-        delegate_pubkey: PublicKey,
-        assertion_principal: FederatedPrincipal,
-        assertion_expiry: u64,
+    fn input_with_delegation_expiry(
+        actor_pubkey: PublicKey,
+        transport: AuthTransport,
+        verified_owner_pubkey: Option<PublicKey>,
         delegation_expiry: u64,
-    ) -> FederatedAuthorization {
-        FederatedAuthorization::Delegated {
-            owner: binding_in(domain, owner_pubkey),
-            assertion_principal,
-            assertion_transport: AssertionTransport::TrustedProxy,
-            assertion_expires_at: AssertionExpiry::new(assertion_expiry)
-                .expect("synthetic assertion expiry is valid"),
-            delegation: VerifiedDelegation::new(
+    ) -> AuthContextInput {
+        let verified_delegation = verified_owner_pubkey.map(|owner_pubkey| {
+            VerifiedTransportDelegation::new_unrestricted(
                 owner_pubkey,
-                delegate_pubkey,
+                actor_pubkey,
                 Some(
                     DelegationExpiry::new(delegation_expiry)
                         .expect("synthetic delegation expiry is valid"),
                 ),
             )
-            .expect("synthetic owner and delegate are distinct"),
+            .expect("synthetic owner and delegate are distinct")
+        });
+        let proof_method = match transport {
+            AuthTransport::RelayWebSocket | AuthTransport::Audio => AuthMethod::Nip42,
+            _ => AuthMethod::Nip98,
+        };
+        AuthContextInput::new(
+            tenant(1),
+            Uuid::from_u128(2),
+            VerifiedNostrProof::new(
+                authorization_domain(1),
+                transport,
+                actor_pubkey,
+                proof_method,
+                verified_delegation,
+            )
+            .expect("synthetic Nostr proof is internally consistent"),
+            AuthorizedCommunityAccess::new(authorization_domain(1), Scope::all_known(), None),
+        )
+    }
+
+    fn proof_in(
+        domain: u128,
+        transport: AuthTransport,
+        actor_pubkey: PublicKey,
+    ) -> VerifiedNostrProof {
+        let proof_method = match transport {
+            AuthTransport::RelayWebSocket | AuthTransport::Audio => AuthMethod::Nip42,
+            _ => AuthMethod::Nip98,
+        };
+        VerifiedNostrProof::new(
+            authorization_domain(domain),
+            transport,
+            actor_pubkey,
+            proof_method,
+            None,
+        )
+        .expect("synthetic Nostr proof is valid")
+    }
+
+    fn community_access_in(domain: u128) -> AuthorizedCommunityAccess {
+        AuthorizedCommunityAccess::new(authorization_domain(domain), Scope::all_known(), None)
+    }
+
+    fn delegated_authorization(
+        domain: u128,
+        owner_pubkey: PublicKey,
+        assertion_principal: FederatedPrincipal,
+        assertion_expiry: u64,
+    ) -> FederatedAuthorization {
+        FederatedAuthorization::Delegated {
+            owner: binding_in(domain, owner_pubkey),
+            assertion: assertion(
+                assertion_principal,
+                AssertionTransport::TrustedProxy,
+                assertion_expiry,
+            ),
         }
     }
 
@@ -997,13 +1497,21 @@ mod tests {
             AuthContextInput::new(
                 tenant(1),
                 correlation_id,
-                AuthTransport::RelayWebSocket,
-                keys.public_key(),
-                AuthMethod::Nip42,
-                None,
-                vec![Scope::MessagesRead],
-                None,
+                VerifiedNostrProof::new(
+                    authorization_domain(1),
+                    AuthTransport::RelayWebSocket,
+                    keys.public_key(),
+                    AuthMethod::Nip42,
+                    None,
+                )
+                .expect("synthetic Nostr proof is valid"),
+                AuthorizedCommunityAccess::new(
+                    authorization_domain(1),
+                    vec![Scope::MessagesRead],
+                    None,
+                ),
             ),
+            policy_not_required(),
             FederatedAuthorization::NotRequired,
             100,
         )
@@ -1015,6 +1523,10 @@ mod tests {
         assert_eq!(context.transport(), AuthTransport::RelayWebSocket);
         assert_eq!(context.pubkey(), keys.public_key());
         assert_eq!(context.auth_method(), AuthMethod::Nip42);
+        assert_eq!(
+            context.federated_policy().requirement(),
+            FederatedIdentityRequirement::NotRequired
+        );
         assert!(context.has_scope(&Scope::MessagesRead));
         assert_eq!(
             context.federated_authorization(),
@@ -1028,12 +1540,10 @@ mod tests {
         let other = Keys::generate();
         let error = AuthContext::finalize_v1(
             input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::AttestedKey),
             FederatedAuthorization::Direct {
                 binding: binding(other.public_key()),
-                assertion_principal: principal(),
-                assertion_transport: AssertionTransport::TrustedProxy,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                assertion_expires_at: AssertionExpiry::new(200).expect("synthetic expiry is valid"),
+                assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
                 reason: AuthorizationReason::ExistingBinding,
             },
             100,
@@ -1052,14 +1562,8 @@ mod tests {
                 AuthTransport::RelayWebSocket,
                 Some(owner.public_key()),
             ),
-            delegated_authorization(
-                1,
-                owner.public_key(),
-                actor.public_key(),
-                principal(),
-                200,
-                200,
-            ),
+            policy_required(EnrollmentMode::AttestedKey),
+            delegated_authorization(1, owner.public_key(), principal(), 200),
             100,
         )
         .expect("verified owner and delegate match");
@@ -1068,6 +1572,22 @@ mod tests {
             context.federated_authorization(),
             FederatedAuthorization::Delegated { .. }
         ));
+    }
+
+    #[test]
+    fn delegated_authorization_requires_verified_delegation() {
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::AttestedKey),
+            delegated_authorization(1, owner.public_key(), principal(), 200),
+            100,
+        )
+        .expect_err("delegated authorization requires verifier-issued proof");
+
+        assert_eq!(error, AuthContextError::DelegationRequired);
+        assert_eq!(error.code(), "federated_delegation_required");
     }
 
     #[test]
@@ -1089,19 +1609,24 @@ mod tests {
             AuthContextInput::new(
                 tenant(1),
                 Uuid::from_u128(2),
-                AuthTransport::RelayWebSocket,
-                actor.public_key(),
-                AuthMethod::Nip42,
-                None,
-                vec![Scope::MessagesRead],
-                Some(vec![channel_id]),
+                VerifiedNostrProof::new(
+                    authorization_domain(1),
+                    AuthTransport::RelayWebSocket,
+                    actor.public_key(),
+                    AuthMethod::Nip42,
+                    None,
+                )
+                .expect("synthetic Nostr proof is valid"),
+                AuthorizedCommunityAccess::new(
+                    authorization_domain(1),
+                    vec![Scope::MessagesRead],
+                    Some(vec![channel_id]),
+                ),
             ),
+            policy_required(EnrollmentMode::AttestedKey),
             FederatedAuthorization::Direct {
                 binding: binding(actor.public_key()),
-                assertion_principal: principal(),
-                assertion_transport: AssertionTransport::TrustedProxy,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                assertion_expires_at: AssertionExpiry::new(200).expect("synthetic expiry is valid"),
+                assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
                 reason: AuthorizationReason::ExistingBinding,
             },
             100,
@@ -1134,12 +1659,10 @@ mod tests {
                 AuthTransport::RelayWebSocket,
                 Some(owner.public_key()),
             ),
+            policy_required(EnrollmentMode::AttestedKey),
             FederatedAuthorization::Direct {
                 binding: binding(actor.public_key()),
-                assertion_principal: principal(),
-                assertion_transport: AssertionTransport::TrustedProxy,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                assertion_expires_at: AssertionExpiry::new(200).expect("synthetic expiry is valid"),
+                assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
                 reason: AuthorizationReason::ExistingBinding,
             },
             100,
@@ -1159,19 +1682,42 @@ mod tests {
                 AuthTransport::RelayWebSocket,
                 Some(owner.public_key()),
             ),
-            delegated_authorization(
-                1,
-                owner.public_key(),
-                actor.public_key(),
-                principal(),
-                100,
-                200,
-            ),
+            policy_required(EnrollmentMode::AttestedKey),
+            delegated_authorization(1, owner.public_key(), principal(), 100),
             100,
         )
         .expect_err("delegated authorization must not survive owner assertion expiry");
 
         assert_eq!(error, AuthContextError::AssertionExpired);
+    }
+
+    #[test]
+    fn delegated_authorization_rejects_a_future_owner_assertion() {
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(
+                actor.public_key(),
+                AuthTransport::RelayWebSocket,
+                Some(owner.public_key()),
+            ),
+            policy_required(EnrollmentMode::AttestedKey),
+            FederatedAuthorization::Delegated {
+                owner: binding(owner.public_key()),
+                assertion: assertion_with_bounds_in(
+                    1,
+                    AuthTransport::RelayWebSocket,
+                    principal(),
+                    AssertionTransport::TrustedProxy,
+                    Some(101),
+                    200,
+                ),
+            },
+            100,
+        )
+        .expect_err("delegated authorization must enforce the owner's not-before bound");
+
+        assert_eq!(error, AuthContextError::AssertionNotYetValid);
     }
 
     #[test]
@@ -1186,14 +1732,8 @@ mod tests {
                 AuthTransport::RelayWebSocket,
                 Some(owner.public_key()),
             ),
-            delegated_authorization(
-                1,
-                owner.public_key(),
-                actor.public_key(),
-                assertion_principal,
-                200,
-                200,
-            ),
+            policy_required(EnrollmentMode::AttestedKey),
+            delegated_authorization(1, owner.public_key(), assertion_principal, 200),
             100,
         )
         .expect_err("the current assertion must identify the bound owner");
@@ -1206,19 +1746,14 @@ mod tests {
         let actor = Keys::generate();
         let owner = Keys::generate();
         let error = AuthContext::finalize_v1(
-            input(
+            input_with_delegation_expiry(
                 actor.public_key(),
                 AuthTransport::RelayWebSocket,
                 Some(owner.public_key()),
-            ),
-            delegated_authorization(
-                1,
-                owner.public_key(),
-                actor.public_key(),
-                principal(),
-                200,
                 100,
             ),
+            policy_required(EnrollmentMode::AttestedKey),
+            delegated_authorization(1, owner.public_key(), principal(), 200),
             100,
         )
         .expect_err("delegated authorization must not survive delegation expiry");
@@ -1227,27 +1762,24 @@ mod tests {
     }
 
     #[test]
-    fn delegated_authorization_requires_the_authenticated_delegate() {
+    fn verified_nostr_proof_requires_the_authenticated_delegate() {
         let actor = Keys::generate();
         let other_delegate = Keys::generate();
         let owner = Keys::generate();
-        let error = AuthContext::finalize_v1(
-            input(
-                actor.public_key(),
-                AuthTransport::RelayWebSocket,
-                Some(owner.public_key()),
-            ),
-            delegated_authorization(
-                1,
-                owner.public_key(),
-                other_delegate.public_key(),
-                principal(),
-                200,
-                200,
-            ),
-            100,
+        let delegation = VerifiedTransportDelegation::new_unrestricted(
+            owner.public_key(),
+            other_delegate.public_key(),
+            None,
         )
-        .expect_err("delegated authorization must name the authenticated actor");
+        .expect("synthetic owner and delegate are distinct");
+        let error = VerifiedNostrProof::new(
+            authorization_domain(1),
+            AuthTransport::RelayWebSocket,
+            actor.public_key(),
+            AuthMethod::Nip42,
+            Some(delegation),
+        )
+        .expect_err("verified proof must name the authenticated actor");
 
         assert_eq!(error, AuthContextError::DelegateKeyMismatch);
     }
@@ -1263,14 +1795,8 @@ mod tests {
                 AuthTransport::RelayWebSocket,
                 Some(other_owner.public_key()),
             ),
-            delegated_authorization(
-                1,
-                owner.public_key(),
-                actor.public_key(),
-                principal(),
-                200,
-                200,
-            ),
+            policy_required(EnrollmentMode::AttestedKey),
+            delegated_authorization(1, owner.public_key(), principal(), 200),
             100,
         )
         .expect_err("delegated authorization must match the verified owner");
@@ -1288,14 +1814,8 @@ mod tests {
                 AuthTransport::RelayWebSocket,
                 Some(owner.public_key()),
             ),
-            delegated_authorization(
-                2,
-                owner.public_key(),
-                actor.public_key(),
-                principal(),
-                200,
-                200,
-            ),
+            policy_required(EnrollmentMode::AttestedKey),
+            delegated_authorization(2, owner.public_key(), principal(), 200),
             100,
         )
         .expect_err("a delegated binding from another domain must be rejected");
@@ -1331,12 +1851,17 @@ mod tests {
     #[test]
     fn evidence_value_debug_output_redacts_numeric_values() {
         let assertion_expiry = AssertionExpiry::new(200).expect("synthetic expiry is valid");
+        let assertion_not_before = AssertionNotBefore::new(100);
         let delegation_expiry = DelegationExpiry::new(300).expect("synthetic expiry is valid");
         let binding_version = BindingVersion::new(400).expect("synthetic version is valid");
 
         assert_eq!(
             format!("{assertion_expiry:?}"),
             "AssertionExpiry(\"[redacted]\")"
+        );
+        assert_eq!(
+            format!("{assertion_not_before:?}"),
+            "AssertionNotBefore(\"[redacted]\")"
         );
         assert_eq!(
             format!("{delegation_expiry:?}"),
@@ -1353,12 +1878,10 @@ mod tests {
         let actor = Keys::generate();
         let error = AuthContext::finalize_v1(
             input(actor.public_key(), AuthTransport::HttpBridge, None),
+            policy_required(EnrollmentMode::AttestedKey),
             FederatedAuthorization::Direct {
                 binding: binding(actor.public_key()),
-                assertion_principal: principal(),
-                assertion_transport: AssertionTransport::ClientAttached,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                assertion_expires_at: AssertionExpiry::new(100).expect("synthetic expiry is valid"),
+                assertion: assertion(principal(), AssertionTransport::ClientAttached, 100),
                 reason: AuthorizationReason::ExistingBinding,
             },
             100,
@@ -1370,20 +1893,45 @@ mod tests {
     }
 
     #[test]
+    fn direct_authorization_rejects_a_future_assertion() {
+        let actor = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(actor.public_key(), AuthTransport::HttpBridge, None),
+            policy_required(EnrollmentMode::AttestedKey),
+            FederatedAuthorization::Direct {
+                binding: binding(actor.public_key()),
+                assertion: assertion_with_bounds_in(
+                    1,
+                    AuthTransport::HttpBridge,
+                    principal(),
+                    AssertionTransport::ClientAttached,
+                    Some(101),
+                    200,
+                ),
+                reason: AuthorizationReason::ExistingBinding,
+            },
+            100,
+        )
+        .expect_err("authorization must enforce the assertion's not-before bound");
+
+        assert_eq!(error, AuthContextError::AssertionNotYetValid);
+        assert_eq!(error.code(), "federated_assertion_not_yet_valid");
+    }
+
+    #[test]
     fn direct_authorization_requires_the_assertion_principal() {
         let actor = Keys::generate();
         let error = AuthContext::finalize_v1(
             input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::AttestedKey),
             FederatedAuthorization::Direct {
                 binding: binding(actor.public_key()),
-                assertion_principal: FederatedPrincipal::new(
-                    "https://idp.example",
-                    "other-subject",
-                )
-                .expect("synthetic principal is valid"),
-                assertion_transport: AssertionTransport::TrustedProxy,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                assertion_expires_at: AssertionExpiry::new(200).expect("synthetic expiry is valid"),
+                assertion: assertion(
+                    FederatedPrincipal::new("https://idp.example", "other-subject")
+                        .expect("synthetic principal is valid"),
+                    AssertionTransport::TrustedProxy,
+                    200,
+                ),
                 reason: AuthorizationReason::ExistingBinding,
             },
             100,
@@ -1399,12 +1947,10 @@ mod tests {
         let actor = Keys::generate();
         let error = AuthContext::finalize_v1(
             input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::Provisioned),
             FederatedAuthorization::Direct {
                 binding: binding(actor.public_key()),
-                assertion_principal: principal(),
-                assertion_transport: AssertionTransport::TrustedProxy,
-                enrollment_mode: EnrollmentMode::Provisioned,
-                assertion_expires_at: AssertionExpiry::new(200).expect("synthetic expiry is valid"),
+                assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
                 reason: AuthorizationReason::EnrolledAttestedKey,
             },
             100,
@@ -1419,15 +1965,13 @@ mod tests {
         let actor = Keys::generate();
         let authorization = FederatedAuthorization::Direct {
             binding: binding(actor.public_key()),
-            assertion_principal: principal(),
-            assertion_transport: AssertionTransport::TrustedProxy,
-            enrollment_mode: EnrollmentMode::Tofu,
-            assertion_expires_at: AssertionExpiry::new(200).expect("synthetic expiry is valid"),
+            assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
             reason: AuthorizationReason::EnrolledTofu,
         };
 
         let context = AuthContext::finalize_v1(
             input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::Tofu),
             authorization,
             100,
         )
@@ -1444,12 +1988,10 @@ mod tests {
         let actor = Keys::generate();
         let error = AuthContext::finalize_v1(
             input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::Tofu),
             FederatedAuthorization::Direct {
                 binding: binding(actor.public_key()),
-                assertion_principal: principal(),
-                assertion_transport: AssertionTransport::TrustedProxy,
-                enrollment_mode: EnrollmentMode::Tofu,
-                assertion_expires_at: AssertionExpiry::new(200).expect("synthetic expiry is valid"),
+                assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
                 reason: AuthorizationReason::EnrolledAttestedKey,
             },
             100,
@@ -1462,19 +2004,14 @@ mod tests {
     #[test]
     fn transport_and_proof_method_must_agree() {
         let actor = Keys::generate();
-        let input = AuthContextInput::new(
-            tenant(1),
-            Uuid::from_u128(2),
+        let error = VerifiedNostrProof::new(
+            authorization_domain(1),
             AuthTransport::RelayWebSocket,
             actor.public_key(),
             AuthMethod::Nip98,
             None,
-            Scope::all_known(),
-            None,
-        );
-
-        let error = AuthContext::finalize_v1(input, FederatedAuthorization::NotRequired, 100)
-            .expect_err("HTTP proof must not authorize a relay WebSocket");
+        )
+        .expect_err("HTTP proof must not authorize a relay WebSocket");
         assert_eq!(error, AuthContextError::TransportProofMismatch);
     }
 
@@ -1483,12 +2020,10 @@ mod tests {
         let actor = Keys::generate();
         let error = AuthContext::finalize_v1(
             input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::AttestedKey),
             FederatedAuthorization::Direct {
                 binding: binding_in(2, actor.public_key()),
-                assertion_principal: principal(),
-                assertion_transport: AssertionTransport::TrustedProxy,
-                enrollment_mode: EnrollmentMode::AttestedKey,
-                assertion_expires_at: AssertionExpiry::new(200).expect("synthetic expiry is valid"),
+                assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
                 reason: AuthorizationReason::ExistingBinding,
             },
             100,
@@ -1509,6 +2044,7 @@ mod tests {
                 AuthTransport::RelayWebSocket,
                 Some(owner.public_key()),
             ),
+            policy_not_required(),
             FederatedAuthorization::NotRequired,
             100,
         )
@@ -1522,19 +2058,196 @@ mod tests {
     }
 
     #[test]
-    fn nostr_only_authorization_rejects_self_delegation() {
+    fn transport_delegation_rejects_self_reference() {
         let actor = Keys::generate();
-        let error = AuthContext::finalize_v1(
-            input(
-                actor.public_key(),
-                AuthTransport::RelayWebSocket,
-                Some(actor.public_key()),
-            ),
-            FederatedAuthorization::NotRequired,
-            100,
+        let error = VerifiedTransportDelegation::new_unrestricted(
+            actor.public_key(),
+            actor.public_key(),
+            None,
         )
         .expect_err("an actor cannot be its own verified owner");
 
         assert_eq!(error, AuthContextError::SelfDelegation);
+    }
+
+    #[test]
+    fn transport_delegation_is_explicitly_transport_wide() {
+        let owner = Keys::generate();
+        let delegate = Keys::generate();
+        let delegation = VerifiedTransportDelegation::new_unrestricted(
+            owner.public_key(),
+            delegate.public_key(),
+            None,
+        )
+        .expect("synthetic owner and delegate are distinct");
+
+        assert_eq!(delegation.capability(), DelegationCapability::TransportWide);
+    }
+
+    #[test]
+    fn required_policy_rejects_nostr_only_authorization() {
+        let actor = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::AttestedKey),
+            FederatedAuthorization::NotRequired,
+            100,
+        )
+        .expect_err("required federated identity cannot be bypassed by the caller");
+
+        assert_eq!(error, AuthContextError::FederatedIdentityRequired);
+        assert_eq!(error.code(), "federated_identity_required");
+    }
+
+    #[test]
+    fn not_required_policy_rejects_federated_authorization() {
+        let actor = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_not_required(),
+            FederatedAuthorization::Direct {
+                binding: binding(actor.public_key()),
+                assertion: assertion(principal(), AssertionTransport::TrustedProxy, 200),
+                reason: AuthorizationReason::ExistingBinding,
+            },
+            100,
+        )
+        .expect_err("federated evidence cannot override the resolved domain policy");
+
+        assert_eq!(error, AuthContextError::UnexpectedFederatedAuthorization);
+        assert_eq!(error.code(), "federated_authorization_unexpected");
+    }
+
+    #[test]
+    fn nostr_proof_cannot_cross_authorization_domains() {
+        let actor = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            AuthContextInput::new(
+                tenant(1),
+                Uuid::from_u128(2),
+                proof_in(2, AuthTransport::RelayWebSocket, actor.public_key()),
+                community_access_in(1),
+            ),
+            policy_not_required(),
+            FederatedAuthorization::NotRequired,
+            100,
+        )
+        .expect_err("a Nostr proof from another domain must be rejected");
+
+        assert_eq!(error, AuthContextError::NostrProofDomainMismatch);
+        assert_eq!(error.code(), "nostr_proof_domain_mismatch");
+    }
+
+    #[test]
+    fn federated_policy_cannot_cross_authorization_domains() {
+        let actor = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            ResolvedFederatedPolicy::not_required(authorization_domain(2)),
+            FederatedAuthorization::NotRequired,
+            100,
+        )
+        .expect_err("policy from another domain must be rejected");
+
+        assert_eq!(error, AuthContextError::PolicyDomainMismatch);
+        assert_eq!(error.code(), "federated_policy_domain_mismatch");
+    }
+
+    #[test]
+    fn community_admission_cannot_cross_authorization_domains() {
+        let actor = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            AuthContextInput::new(
+                tenant(1),
+                Uuid::from_u128(2),
+                proof_in(1, AuthTransport::RelayWebSocket, actor.public_key()),
+                community_access_in(2),
+            ),
+            policy_not_required(),
+            FederatedAuthorization::NotRequired,
+            100,
+        )
+        .expect_err("community admission from another domain must be rejected");
+
+        assert_eq!(error, AuthContextError::CommunityAccessDomainMismatch);
+        assert_eq!(error.code(), "community_access_domain_mismatch");
+    }
+
+    #[test]
+    fn assertion_cannot_cross_authorization_domains() {
+        let actor = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::AttestedKey),
+            FederatedAuthorization::Direct {
+                binding: binding(actor.public_key()),
+                assertion: assertion_in(
+                    2,
+                    AuthTransport::RelayWebSocket,
+                    principal(),
+                    AssertionTransport::TrustedProxy,
+                    200,
+                ),
+                reason: AuthorizationReason::ExistingBinding,
+            },
+            100,
+        )
+        .expect_err("an assertion from another domain must be rejected");
+
+        assert_eq!(error, AuthContextError::AssertionDomainMismatch);
+        assert_eq!(error.code(), "federated_assertion_domain_mismatch");
+    }
+
+    #[test]
+    fn assertion_must_match_the_authorized_transport() {
+        let actor = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(actor.public_key(), AuthTransport::RelayWebSocket, None),
+            policy_required(EnrollmentMode::AttestedKey),
+            FederatedAuthorization::Direct {
+                binding: binding(actor.public_key()),
+                assertion: assertion_in(
+                    1,
+                    AuthTransport::HttpBridge,
+                    principal(),
+                    AssertionTransport::TrustedProxy,
+                    200,
+                ),
+                reason: AuthorizationReason::ExistingBinding,
+            },
+            100,
+        )
+        .expect_err("an assertion verified for another transport must be rejected");
+
+        assert_eq!(error, AuthContextError::AssertionTransportMismatch);
+        assert_eq!(error.code(), "federated_assertion_transport_mismatch");
+    }
+
+    #[test]
+    fn delegated_assertion_must_match_the_authorized_transport() {
+        let actor = Keys::generate();
+        let owner = Keys::generate();
+        let error = AuthContext::finalize_v1(
+            input(
+                actor.public_key(),
+                AuthTransport::RelayWebSocket,
+                Some(owner.public_key()),
+            ),
+            policy_required(EnrollmentMode::AttestedKey),
+            FederatedAuthorization::Delegated {
+                owner: binding(owner.public_key()),
+                assertion: assertion_in(
+                    1,
+                    AuthTransport::HttpBridge,
+                    principal(),
+                    AssertionTransport::TrustedProxy,
+                    200,
+                ),
+            },
+            100,
+        )
+        .expect_err("a delegated assertion for another transport must be rejected");
+
+        assert_eq!(error, AuthContextError::AssertionTransportMismatch);
     }
 }
