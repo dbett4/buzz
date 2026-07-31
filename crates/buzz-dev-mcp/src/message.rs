@@ -10,6 +10,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 const SEND_TIMEOUT: Duration = Duration::from_secs(20);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub struct MessagingState {
     _shim: Shim,
@@ -40,6 +41,21 @@ pub struct SendMessageParams {
     pub mentions: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct UploadFileParams {
+    /// Absolute or workspace-relative path to the file to upload.
+    pub file: String,
+}
+
+pub fn upload_file_args(p: &UploadFileParams) -> Vec<String> {
+    vec![
+        "upload".to_string(),
+        "file".to_string(),
+        "--file".to_string(),
+        p.file.clone(),
+    ]
+}
+
 pub fn send_message_args(p: &SendMessageParams) -> Vec<String> {
     let mut args = vec![
         "messages".to_string(),
@@ -58,6 +74,58 @@ pub fn send_message_args(p: &SendMessageParams) -> Vec<String> {
         args.push(mention.clone());
     }
     args
+}
+
+pub async fn upload_file(
+    state: &Arc<MessagingState>,
+    p: UploadFileParams,
+) -> Result<CallToolResult, ErrorData> {
+    let file = p.file.trim();
+    if file.is_empty() {
+        return Ok(CallToolResult::error(vec![Content::text(
+            "file must not be empty",
+        )]));
+    }
+
+    let meta = match std::fs::metadata(file) {
+        Ok(meta) => meta,
+        Err(error) => {
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "file not accessible: {file} ({error})"
+            ))]));
+        }
+    };
+    if !meta.is_file() {
+        return Ok(CallToolResult::error(vec![Content::text(format!(
+            "not a regular file: {file}"
+        ))]));
+    }
+
+    let mut command = Command::new(&state.buzz_path);
+    command
+        .args(upload_file_args(&p))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(UPLOAD_TIMEOUT, command.output()).await {
+        Ok(result) => result.map_err(|error| ErrorData::internal_error(error.to_string(), None))?,
+        Err(_) => {
+            return Ok(CallToolResult::error(vec![Content::text(
+                "buzz upload file timed out after 120 seconds",
+            )]));
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if output.status.success() {
+        Ok(CallToolResult::success(vec![Content::text(stdout)]))
+    } else {
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        Ok(CallToolResult::error(vec![Content::text(format!(
+            "buzz upload file failed ({}): {detail}",
+            output.status
+        ))]))
+    }
 }
 
 pub async fn send_message(

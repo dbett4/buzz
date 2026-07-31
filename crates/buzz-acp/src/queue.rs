@@ -1251,11 +1251,11 @@ fn resolve_reply_anchor(
 
 /// Hint text when secure messaging (`buzz-message-mcp`) is active.
 const SECURE_CONTEXT_HINT: &str =
-    "Conversation context is harness-supplied; use the send_message tool for replies.";
+    "Conversation context is harness-supplied; use upload_file for file attachments and send_message for replies.";
 
 /// Hint text when secure messaging is active and context was fetched.
 const SECURE_CONTEXT_INCLUDED_HINT: &str =
-    "Channel context included below. Conversation history is harness-supplied; use the send_message tool for replies.";
+    "Channel context included below. Conversation history is harness-supplied; use upload_file for file attachments and send_message for replies.";
 
 /// Format a `[Context]` hints section based on event scope.
 ///
@@ -1286,9 +1286,9 @@ fn format_context_hints(
         // DM non-replies use get for recent conversation.
         let ctx_hint = if secure_messaging {
             if has_conversation_context && is_reply {
-                "Thread context included below. Conversation history is harness-supplied; use the send_message tool for replies."
+                "Thread context included below. Conversation history is harness-supplied; use upload_file for file attachments and send_message for replies."
             } else if has_conversation_context {
-                "Conversation context included below. Conversation history is harness-supplied; use the send_message tool for replies."
+                "Conversation context included below. Conversation history is harness-supplied; use upload_file for file attachments and send_message for replies."
             } else {
                 SECURE_CONTEXT_HINT
             }
@@ -1323,7 +1323,7 @@ fn format_context_hints(
     } else if let Some(ref root) = thread_tags.root_event_id {
         let ctx_hint = if secure_messaging {
             if has_conversation_context {
-                "Thread context included below. Conversation history is harness-supplied; use the send_message tool for replies."
+                "Thread context included below. Conversation history is harness-supplied; use upload_file for file attachments and send_message for replies."
             } else {
                 SECURE_CONTEXT_HINT
             }
@@ -3359,7 +3359,8 @@ mod tests {
         .join("\n\n");
 
         assert!(prompt.contains("harness-supplied"));
-        assert!(prompt.contains("send_message tool"));
+        assert!(prompt.contains("upload_file"));
+        assert!(prompt.contains("send_message"));
         assert!(prompt.contains("`reply_to` argument"));
         assert!(!prompt.contains("use `--reply-to"));
         assert!(!prompt.contains("buzz messages get"));

@@ -58,6 +58,17 @@ impl MessagingMcp {
     }
 
     #[tool(
+        name = "upload_file",
+        description = "Upload one file to the relay Blossom store. Credentials stay inside this restricted MCP server and are never exposed to terminal or execute-code tools. Returns the upload descriptor JSON (url, sha256, size, type)."
+    )]
+    async fn upload_file(
+        &self,
+        Parameters(p): Parameters<message::UploadFileParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        message::upload_file(&self.state, p).await
+    }
+
+    #[tool(
         name = "send_message",
         description = "Send one authenticated Buzz message. Credentials stay inside this restricted MCP server and are never exposed to terminal or execute-code tools."
     )]
@@ -78,7 +89,9 @@ impl ServerHandler for MessagingMcp {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "Use send_message for Buzz replies. Signing credentials are isolated in this server.",
+                "Use upload_file for file attachments and send_message for Buzz replies. \
+                 Signing credentials are isolated in this server; do not use terminal or \
+                 execute-code tools for `buzz upload` or `buzz messages send`.",
             )
     }
 }
@@ -262,6 +275,17 @@ mod messaging_profile_tests {
         assert_eq!(
             mcp_profile_for_command("buzz-dev-mcp"),
             McpProfile::Developer
+        );
+    }
+
+    #[test]
+    fn messaging_upload_builds_only_the_fixed_buzz_cli_command() {
+        let args = message::upload_file_args(&message::UploadFileParams {
+            file: "/tmp/screenshot.png".to_string(),
+        });
+        assert_eq!(
+            args,
+            vec!["upload", "file", "--file", "/tmp/screenshot.png",]
         );
     }
 
