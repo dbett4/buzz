@@ -1337,11 +1337,24 @@ async fn publish_harness_fallback(
     let Some(batch) = batch else {
         return;
     };
-    let thread_tags = batch
-        .events
-        .last()
-        .map(|event| crate::queue::parse_thread_tags(&event.event))
-        .unwrap_or_default();
+    let Some(trigger) = batch.events.last() else {
+        return;
+    };
+    let thread_tags = crate::queue::parse_thread_tags(&trigger.event);
+    if external_delivery_already_recorded(
+        batch.channel_id,
+        &trigger.event.id.to_hex(),
+        &thread_tags,
+        trigger.event.created_at.as_secs(),
+    ) {
+        tracing::info!(
+            target: "pool::delivery",
+            channel = %batch.channel_id,
+            trigger = %trigger.event.id,
+            "credential-isolated sender already delivered this turn; suppressing harness fallback"
+        );
+        return;
+    }
     tracing::warn!(
         target: "pool::delivery",
         channel = %batch.channel_id,
@@ -1354,6 +1367,72 @@ async fn publish_harness_fallback(
         fallback_reply.trim(),
     )
     .await;
+}
+
+#[derive(serde::Deserialize)]
+struct ExternalDeliveryRecord {
+    version: u8,
+    channel: String,
+    reply_to: Option<String>,
+    sent_at: u64,
+}
+
+/// Reconcile a successful credential-isolated sender call with the harness's
+/// final-text fallback. Cursor invokes the sender through a shell tool, so ACP
+/// cannot observe it as `mcp__buzz_message_mcp__send_message`; without this
+/// local receipt both the sender and fallback publish the same turn.
+fn external_delivery_already_recorded(
+    channel_id: Uuid,
+    trigger_event_id: &str,
+    thread_tags: &ThreadTags,
+    trigger_created_at: u64,
+) -> bool {
+    let Ok(path) = std::env::var("BUZZ_ACP_EXTERNAL_DELIVERY_LEDGER") else {
+        return false;
+    };
+    if path.trim().is_empty() {
+        return false;
+    }
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() > 2_097_152 {
+        return false;
+    }
+    let Ok(ledger) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    external_delivery_ledger_matches(
+        &ledger,
+        channel_id,
+        trigger_event_id,
+        thread_tags,
+        trigger_created_at,
+    )
+}
+
+fn external_delivery_ledger_matches(
+    ledger: &str,
+    channel_id: Uuid,
+    trigger_event_id: &str,
+    thread_tags: &ThreadTags,
+    trigger_created_at: u64,
+) -> bool {
+    let channel = channel_id.to_string();
+    let reply_matches = |reply_to: &str| {
+        reply_to == trigger_event_id
+            || thread_tags.root_event_id.as_deref() == Some(reply_to)
+            || thread_tags.parent_event_id.as_deref() == Some(reply_to)
+    };
+    ledger.lines().rev().take(512).any(|line| {
+        let Ok(record) = serde_json::from_str::<ExternalDeliveryRecord>(line) else {
+            return false;
+        };
+        record.version == 1
+            && record.channel == channel
+            && record.sent_at >= trigger_created_at
+            && record.reply_to.as_deref().is_some_and(reply_matches)
+    })
 }
 
 /// Core async function spawned for each prompt.
@@ -4998,6 +5077,58 @@ mod tests {
             cancelled_events: vec![],
             cancel_reason: None,
         }
+    }
+
+    #[test]
+    fn external_delivery_ledger_suppresses_only_matching_successful_turn() {
+        let channel_id = Uuid::new_v4();
+        let trigger = "a".repeat(64);
+        let ledger = format!(
+            "not-json\n{{\"version\":1,\"channel\":\"{channel_id}\",\"reply_to\":\"{trigger}\",\"content_sha256\":\"ignored\",\"sent_at\":101}}\n"
+        );
+        assert!(external_delivery_ledger_matches(
+            &ledger,
+            channel_id,
+            &trigger,
+            &ThreadTags::default(),
+            100,
+        ));
+        assert!(!external_delivery_ledger_matches(
+            &ledger,
+            Uuid::new_v4(),
+            &trigger,
+            &ThreadTags::default(),
+            100,
+        ));
+        assert!(!external_delivery_ledger_matches(
+            &ledger,
+            channel_id,
+            &trigger,
+            &ThreadTags::default(),
+            102,
+        ));
+    }
+
+    #[test]
+    fn external_delivery_ledger_accepts_thread_root_reply_target() {
+        let channel_id = Uuid::new_v4();
+        let root = "b".repeat(64);
+        let trigger = "c".repeat(64);
+        let ledger = format!(
+            "{{\"version\":1,\"channel\":\"{channel_id}\",\"reply_to\":\"{root}\",\"sent_at\":201}}\n"
+        );
+        let tags = ThreadTags {
+            root_event_id: Some(root),
+            parent_event_id: None,
+            ..ThreadTags::default()
+        };
+        assert!(external_delivery_ledger_matches(
+            &ledger,
+            channel_id,
+            &trigger,
+            &tags,
+            200,
+        ));
     }
 
     #[test]
