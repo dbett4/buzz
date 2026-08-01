@@ -1543,10 +1543,12 @@ async fn tokio_main() -> Result<()> {
             Some(include_str!("base_prompt.md"))
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd: std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            .to_string_lossy()
-            .to_string(),
+        cwd: std::env::var("BUZZ_ACP_SESSION_CWD").unwrap_or_else(|_| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("/"))
+                .to_string_lossy()
+                .to_string()
+        }),
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
@@ -4203,7 +4205,15 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
         .and_then(|s| s.to_str())
         .unwrap_or("mcp")
         .to_string();
-    let can_sign_buzz_messages = server_name == "buzz-message-mcp";
+    let inject_signing_credential = std::env::var("BUZZ_ACP_MCP_INJECT_SIGNING_CREDENTIAL")
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "off"
+            )
+        })
+        .unwrap_or(true);
+    let can_sign_buzz_messages = server_name == "buzz-message-mcp" && inject_signing_credential;
     vec![McpServer {
         name: server_name,
         command: config.mcp_command.clone(),
